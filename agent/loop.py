@@ -5,6 +5,12 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from agent.approvals import (
+    create_pending_approval,
+    get_approval_record,
+    summarize_approval_state,
+    update_approval_status,
+)
 from agent.client import call_lattice
 from agent.scenarios import get_next_scenario
 
@@ -18,7 +24,7 @@ def _utc_now() -> str:
 
 def _extract_risk(response: dict[str, Any]) -> dict[str, Any] | None:
     """
-    Pull the risk block out of the lattice response.
+    Pull risk block out of lattice response.
     """
     result = response.get("result")
     if not isinstance(result, dict):
@@ -33,7 +39,7 @@ def _extract_risk(response: dict[str, Any]) -> dict[str, Any] | None:
 
 def _summarize_response(scenario: str, response: dict[str, Any]) -> str:
     """
-    Build a concise operator summary line.
+    Build a concise summary line for each loop iteration.
     """
     status = str(response.get("status", "unknown"))
     message = str(response.get("message", ""))
@@ -44,7 +50,7 @@ def _summarize_response(scenario: str, response: dict[str, Any]) -> str:
             f"[nre_agent] ts={_utc_now()} "
             f"scenario={scenario} "
             f"status={status} "
-            f'message="{message}"'
+            f'message=\"{message}\"'
         )
 
     risk_level = str(risk.get("risk_level", "unknown"))
@@ -58,24 +64,67 @@ def _summarize_response(scenario: str, response: dict[str, Any]) -> str:
         f"risk_level={risk_level} "
         f"blast_radius={blast_radius} "
         f"requires_approval={requires_approval} "
-        f'message="{message}"'
+        f'message=\"{message}\"'
     )
+
+
+def _precheck_approval_gate(scenario: str) -> bool:
+    """
+    Enforce approval state before calling lattice.
+
+    Returns True when the agent is allowed to proceed.
+    Returns False when the scenario should be skipped for now.
+
+    Rules:
+    pending   -> hold
+    rejected  -> suppress
+    approved  -> proceed
+    no record -> proceed
+    """
+    record = get_approval_record(scenario)
+    if record is None:
+        return True
+
+    if record.status == "pending":
+        print(
+            f"[nre_agent] ts={_utc_now()} scenario={scenario} "
+            f"approval_gate=hold approval_status=pending",
+            flush=True,
+        )
+        return False
+
+    if record.status == "rejected":
+        print(
+            f"[nre_agent] ts={_utc_now()} scenario={scenario} "
+            f"approval_gate=suppress approval_status=rejected",
+            flush=True,
+        )
+        return False
+
+    if record.status == "approved":
+        print(
+            f"[nre_agent] ts={_utc_now()} scenario={scenario} "
+            f"approval_gate=open approval_status=approved",
+            flush=True,
+        )
+        return True
+
+    return True
 
 
 def _handle_policy_outcome(scenario: str, response: dict[str, Any]) -> None:
     """
-    Minimal policy-aware agent behavior.
+    Policy aware agent behavior.
 
-    Current behavior:
-    - low risk: continue
-    - medium risk: log caution
-    - approval required or high risk: log escalation
+    low
+    continue
 
-    Later this can evolve into:
-    - Slack / email approval workflow
-    - change window checks
-    - suppression rules
-    - auto-pause
+    medium
+    caution
+
+    high or approval required
+    create or reuse approval record
+    enforce approval transitions
     """
     risk = _extract_risk(response)
     if risk is None:
@@ -87,14 +136,39 @@ def _handle_policy_outcome(scenario: str, response: dict[str, Any]) -> None:
 
     risk_level = str(risk.get("risk_level", "unknown"))
     requires_approval = bool(risk.get("requires_approval", False))
-    reasons = risk.get("reasons", [])
+    blast_radius_score = int(risk.get("blast_radius_score", 0))
+    reasons = [str(x) for x in risk.get("reasons", [])]
 
     if requires_approval or risk_level == "high":
+        record = create_pending_approval(
+            scenario=scenario,
+            risk_level=risk_level,
+            blast_radius_score=blast_radius_score,
+            reasons=reasons,
+        )
+
         print(
             f"[nre_agent] ts={_utc_now()} scenario={scenario} "
-            f"policy_action=escalate reasons={reasons}",
+            f"policy_action=escalate approval_status={record.status} reasons={reasons}",
             flush=True,
         )
+
+        # Optional test override for simulated approval or rejection.
+        simulated_status = os.environ.get("NRE_AGENT_APPROVAL_STATUS", "").strip().lower()
+        if simulated_status in {"approved", "rejected"}:
+            updated = update_approval_status(scenario, simulated_status)
+            print(
+                f"[nre_agent] ts={_utc_now()} scenario={scenario} "
+                f"approval_transition={updated.status}",
+                flush=True,
+            )
+
+        summary = summarize_approval_state(scenario)
+        if summary is not None:
+            print(
+                f"[nre_agent] ts={_utc_now()} scenario={scenario} approval_record={summary}",
+                flush=True,
+            )
         return
 
     if risk_level == "medium":
@@ -116,11 +190,12 @@ def run_agent_loop() -> None:
     Continuous outer agent loop.
 
     Responsibilities:
-    - choose scenario
-    - call lattice
-    - summarize result
-    - react to policy outcome
-    - sleep and repeat
+    choose scenario
+    enforce approval gate before high risk retries
+    call lattice
+    summarize result
+    react to policy outcome
+    sleep and repeat
     """
     interval_seconds = int(os.environ.get("NRE_AGENT_INTERVAL_SECONDS", "30"))
 
@@ -131,6 +206,13 @@ def run_agent_loop() -> None:
             scenario = get_next_scenario()
 
             print(f"[nre_agent] selected scenario: {scenario}", flush=True)
+
+            # -----------------------------------------------------
+            # Approval enforcement before execution attempt
+            # -----------------------------------------------------
+            if not _precheck_approval_gate(scenario):
+                time.sleep(interval_seconds)
+                continue
 
             response = call_lattice(scenario=scenario)
 
