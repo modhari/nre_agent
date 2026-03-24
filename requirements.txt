@@ -1,8 +1,3 @@
-# HTTP client (better than urllib for retries, timeouts, etc.)
 requests==2.31.0
-
-# Optional: structured logging (useful for agents)
-structlog==24.1.0
-
-# Optional: future async support (if you move to async agent loop)
-httpx==0.27.0
+fastapi==0.115.0
+uvicorn==0.30.6

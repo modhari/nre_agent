@@ -5,34 +5,33 @@ import os
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 
 @dataclass(frozen=True)
 class ApprovalRecord:
     """
-    Simple approval record stored as JSON.
+    Approval record stored as JSON on persistent storage.
 
     status
     pending, approved, or rejected
 
     scenario
-    Scenario that triggered the approval flow
+    Scenario that triggered approval logic
 
     created_at
     UTC timestamp when the request was created
 
     updated_at
-    UTC timestamp for the most recent status update
+    UTC timestamp of most recent status change
 
     risk_level
     Risk level returned by lattice and MCP
 
     blast_radius_score
-    Numeric blast radius returned by lattice and MCP
+    Numeric blast radius score
 
     reasons
-    Human readable reasons for the escalation
+    Human readable explanation for escalation
     """
 
     status: str
@@ -55,14 +54,9 @@ def _approval_dir() -> Path:
     """
     Directory where approval records are stored.
 
-    This is intentionally file based for a first working version.
-    Later this can move to:
-    Kubernetes resources
-    Redis
-    Postgres
-    workflow engine
+    This is backed by the PVC mounted into the nre_agent pod.
     """
-    root = os.environ.get("NRE_AGENT_APPROVAL_DIR", "/tmp/nre_agent_approvals")
+    root = os.environ.get("NRE_AGENT_APPROVAL_DIR", "/data/nre_agent_approvals")
     path = Path(root)
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -96,6 +90,33 @@ def get_approval_record(scenario: str) -> ApprovalRecord | None:
     )
 
 
+def list_approval_records() -> list[ApprovalRecord]:
+    """
+    Return all approval records from the approval directory.
+    """
+    records: list[ApprovalRecord] = []
+
+    for path in sorted(_approval_dir().glob("*.json")):
+        try:
+            data = json.loads(path.read_text())
+            records.append(
+                ApprovalRecord(
+                    status=str(data["status"]),
+                    scenario=str(data["scenario"]),
+                    created_at=str(data["created_at"]),
+                    updated_at=str(data["updated_at"]),
+                    risk_level=str(data["risk_level"]),
+                    blast_radius_score=int(data["blast_radius_score"]),
+                    reasons=[str(x) for x in data.get("reasons", [])],
+                )
+            )
+        except Exception:
+            # Ignore malformed files rather than crashing the API or loop.
+            continue
+
+    return records
+
+
 def create_pending_approval(
     scenario: str,
     risk_level: str,
@@ -126,7 +147,7 @@ def create_pending_approval(
 
 def update_approval_status(scenario: str, status: str) -> ApprovalRecord:
     """
-    Update an approval record to approved or rejected.
+    Update an approval record to pending, approved, or rejected.
     """
     current = get_approval_record(scenario)
     if current is None:
@@ -158,9 +179,9 @@ def clear_approval_record(scenario: str) -> None:
         path.unlink()
 
 
-def summarize_approval_state(scenario: str) -> dict[str, Any] | None:
+def summarize_approval_state(scenario: str) -> dict | None:
     """
-    Return a small dict summary for operator logging.
+    Return a compact summary for operator logs.
     """
     record = get_approval_record(scenario)
     if record is None:

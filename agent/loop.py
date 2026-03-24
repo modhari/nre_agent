@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from agent.approvals import (
+    clear_approval_record,
     create_pending_approval,
     get_approval_record,
     summarize_approval_state,
@@ -15,11 +16,60 @@ from agent.client import call_lattice
 from agent.scenarios import get_next_scenario
 
 
+# In memory cooldown tracking for the current pod lifetime.
+# This prevents immediate re creation of pending approval records
+# right after an approved execution attempt.
+_APPROVAL_COOLDOWN_UNTIL: dict[str, datetime] = {}
+
+
 def _utc_now() -> str:
     """
     Return UTC timestamp for operator friendly logs.
     """
     return datetime.now(timezone.utc).isoformat()
+
+
+def _utc_now_dt() -> datetime:
+    """
+    Return UTC datetime object.
+    """
+    return datetime.now(timezone.utc)
+
+
+def _cooldown_seconds() -> int:
+    """
+    Cooldown window after an approved reopen and execution.
+
+    This is intentionally simple.
+    Later this can move into persistent state or policy config.
+    """
+    return int(os.environ.get("NRE_AGENT_APPROVAL_COOLDOWN_SECONDS", "300"))
+
+
+def _set_cooldown(scenario: str) -> None:
+    """
+    Start cooldown for a scenario after approval is consumed.
+    """
+    _APPROVAL_COOLDOWN_UNTIL[scenario] = _utc_now_dt() + timedelta(seconds=_cooldown_seconds())
+
+
+def _get_cooldown_remaining_seconds(scenario: str) -> int:
+    """
+    Return remaining cooldown seconds for a scenario.
+    """
+    expires = _APPROVAL_COOLDOWN_UNTIL.get(scenario)
+    if expires is None:
+        return 0
+
+    remaining = int((expires - _utc_now_dt()).total_seconds())
+    return max(remaining, 0)
+
+
+def _is_in_cooldown(scenario: str) -> bool:
+    """
+    Check whether the scenario is still in cooldown.
+    """
+    return _get_cooldown_remaining_seconds(scenario) > 0
 
 
 def _extract_risk(response: dict[str, Any]) -> dict[str, Any] | None:
@@ -68,6 +118,32 @@ def _summarize_response(scenario: str, response: dict[str, Any]) -> str:
     )
 
 
+def _apply_simulated_approval_override(scenario: str) -> None:
+    """
+    Apply an optional approval override before gate enforcement.
+
+    This matters because the approval gate may otherwise hold
+    the scenario before the loop reaches policy handling logic.
+    """
+    simulated_status = os.environ.get("NRE_AGENT_APPROVAL_STATUS", "").strip().lower()
+    if simulated_status not in {"approved", "rejected"}:
+        return
+
+    record = get_approval_record(scenario)
+    if record is None:
+        return
+
+    if record.status == simulated_status:
+        return
+
+    updated = update_approval_status(scenario, simulated_status)
+    print(
+        f"[nre_agent] ts={_utc_now()} scenario={scenario} "
+        f"approval_transition={updated.status}",
+        flush=True,
+    )
+
+
 def _precheck_approval_gate(scenario: str) -> bool:
     """
     Enforce approval state before calling lattice.
@@ -78,9 +154,19 @@ def _precheck_approval_gate(scenario: str) -> bool:
     Rules:
     pending   -> hold
     rejected  -> suppress
-    approved  -> proceed
+    approved  -> reopen and proceed once
+    cooldown  -> skip repeated approval churn
     no record -> proceed
     """
+    if _is_in_cooldown(scenario):
+        remaining = _get_cooldown_remaining_seconds(scenario)
+        print(
+            f"[nre_agent] ts={_utc_now()} scenario={scenario} "
+            f"approval_gate=cooldown remaining_seconds={remaining}",
+            flush=True,
+        )
+        return False
+
     record = get_approval_record(scenario)
     if record is None:
         return True
@@ -104,7 +190,17 @@ def _precheck_approval_gate(scenario: str) -> bool:
     if record.status == "approved":
         print(
             f"[nre_agent] ts={_utc_now()} scenario={scenario} "
-            f"approval_gate=open approval_status=approved",
+            f"approval_gate=reopen approval_status=approved",
+            flush=True,
+        )
+
+        # Clear the approval record so the scenario can proceed.
+        # The next high risk result will not immediately recreate a
+        # pending record because cooldown is applied after execution.
+        clear_approval_record(scenario)
+
+        print(
+            f"[nre_agent] ts={_utc_now()} scenario={scenario} approval_gate=proceed",
             flush=True,
         )
         return True
@@ -123,8 +219,7 @@ def _handle_policy_outcome(scenario: str, response: dict[str, Any]) -> None:
     caution
 
     high or approval required
-    create or reuse approval record
-    enforce approval transitions
+    create or reuse approval record, unless cooldown is active
     """
     risk = _extract_risk(response)
     if risk is None:
@@ -140,6 +235,15 @@ def _handle_policy_outcome(scenario: str, response: dict[str, Any]) -> None:
     reasons = [str(x) for x in risk.get("reasons", [])]
 
     if requires_approval or risk_level == "high":
+        if _is_in_cooldown(scenario):
+            remaining = _get_cooldown_remaining_seconds(scenario)
+            print(
+                f"[nre_agent] ts={_utc_now()} scenario={scenario} "
+                f"policy_action=cooldown remaining_seconds={remaining}",
+                flush=True,
+            )
+            return
+
         record = create_pending_approval(
             scenario=scenario,
             risk_level=risk_level,
@@ -152,16 +256,6 @@ def _handle_policy_outcome(scenario: str, response: dict[str, Any]) -> None:
             f"policy_action=escalate approval_status={record.status} reasons={reasons}",
             flush=True,
         )
-
-        # Optional test override for simulated approval or rejection.
-        simulated_status = os.environ.get("NRE_AGENT_APPROVAL_STATUS", "").strip().lower()
-        if simulated_status in {"approved", "rejected"}:
-            updated = update_approval_status(scenario, simulated_status)
-            print(
-                f"[nre_agent] ts={_utc_now()} scenario={scenario} "
-                f"approval_transition={updated.status}",
-                flush=True,
-            )
 
         summary = summarize_approval_state(scenario)
         if summary is not None:
@@ -185,16 +279,47 @@ def _handle_policy_outcome(scenario: str, response: dict[str, Any]) -> None:
     )
 
 
+def _post_execution_bookkeeping(scenario: str, response: dict[str, Any]) -> None:
+    """
+    Apply post execution bookkeeping.
+
+    If a scenario was reopened through approval and still came back
+    high risk, enter cooldown so the agent does not immediately create
+    a new pending request on the next cycle.
+    """
+    risk = _extract_risk(response)
+    if risk is None:
+        return
+
+    risk_level = str(risk.get("risk_level", "unknown"))
+    requires_approval = bool(risk.get("requires_approval", False))
+
+    # If the scenario has no approval record now, it means the gate
+    # was reopened and the record was cleared before execution.
+    # If the result still requires approval, start cooldown.
+    record = get_approval_record(scenario)
+    if record is None and (requires_approval or risk_level == "high"):
+        _set_cooldown(scenario)
+        remaining = _get_cooldown_remaining_seconds(scenario)
+        print(
+            f"[nre_agent] ts={_utc_now()} scenario={scenario} "
+            f"post_execution=cooldown_started remaining_seconds={remaining}",
+            flush=True,
+        )
+
+
 def run_agent_loop() -> None:
     """
     Continuous outer agent loop.
 
     Responsibilities:
     choose scenario
-    enforce approval gate before high risk retries
+    apply approval override before gate check
+    enforce approval gate
     call lattice
     summarize result
     react to policy outcome
+    apply post execution bookkeeping
     sleep and repeat
     """
     interval_seconds = int(os.environ.get("NRE_AGENT_INTERVAL_SECONDS", "30"))
@@ -207,9 +332,10 @@ def run_agent_loop() -> None:
 
             print(f"[nre_agent] selected scenario: {scenario}", flush=True)
 
-            # -----------------------------------------------------
-            # Approval enforcement before execution attempt
-            # -----------------------------------------------------
+            # Apply any simulated approval override before checking the gate.
+            _apply_simulated_approval_override(scenario)
+
+            # Enforce approval state before execution attempt.
             if not _precheck_approval_gate(scenario):
                 time.sleep(interval_seconds)
                 continue
@@ -221,6 +347,7 @@ def run_agent_loop() -> None:
 
             print(_summarize_response(scenario, response), flush=True)
             _handle_policy_outcome(scenario, response)
+            _post_execution_bookkeeping(scenario, response)
 
         except Exception as exc:
             print(
