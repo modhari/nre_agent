@@ -7,6 +7,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from agent.approval_state import (
+    build_plan_state,
+    plan_state_to_dict,
+    summarize_plan_state,
+)
 from agent.approvals import (
     clear_approval_record,
     create_pending_approval,
@@ -64,10 +69,10 @@ def _cooldown_seconds() -> int:
 
 def _set_cooldown(key: str) -> None:
     """
-    Start cooldown for a key after approval is consumed.
+    Start cooldown for a key after an approval has been consumed.
 
-    The key can be a scenario name in scenario mode or an incident id in BGP diagnostics
-    mode. Using one common mechanism keeps the loop simple.
+    The key can be a scenario name in scenario mode or an incident id in BGP
+    diagnostics mode.
     """
     _APPROVAL_COOLDOWN_UNTIL[key] = _utc_now_dt() + timedelta(seconds=_cooldown_seconds())
 
@@ -141,8 +146,8 @@ def _apply_simulated_approval_override(key: str) -> None:
     """
     Apply an optional approval override before gate enforcement.
 
-    This matters because the approval gate may otherwise hold
-    the scenario or incident before the loop reaches policy handling logic.
+    This matters because the approval gate may otherwise hold the scenario or incident
+    before the loop reaches policy handling logic.
     """
     simulated_status = os.environ.get("NRE_AGENT_APPROVAL_STATUS", "").strip().lower()
     if simulated_status not in {"approved", "rejected"}:
@@ -166,9 +171,6 @@ def _apply_simulated_approval_override(key: str) -> None:
 def _precheck_approval_gate(key: str) -> bool:
     """
     Enforce approval state before calling lattice in scenario mode.
-
-    Returns True when the agent is allowed to proceed.
-    Returns False when the scenario should be skipped for now.
     """
     if _is_in_cooldown(key):
         remaining = _get_cooldown_remaining_seconds(key)
@@ -219,7 +221,7 @@ def _precheck_approval_gate(key: str) -> bool:
 
 def _handle_policy_outcome(scenario: str, response: dict[str, Any]) -> None:
     """
-    Policy aware agent behavior for traditional scenario mode.
+    Policy aware agent behavior for scenario mode.
     """
     risk = _extract_risk(response)
     if risk is None:
@@ -318,15 +320,16 @@ def _load_bgp_snapshot() -> dict[str, Any]:
 
 def _run_bgp_diagnostics_iteration() -> None:
     """
-    Execute one BGP diagnostics and decision iteration.
+    Execute one BGP diagnostics and stateful planning iteration.
 
     This path is intentionally non executable.
     It does all of the following:
     calls lattice diagnostics
     builds an internal decision object
-    builds a future execution plan shape
-    suppresses duplicate child gated actions under a grouped incident
-    creates a pending approval record for the incident when needed
+    builds an execution plan shape
+    creates or reuses incident approval state
+    derives the current plan state
+    never executes changes
     """
     fabric = os.environ.get("NRE_AGENT_BGP_FABRIC", "default").strip() or "default"
     device = os.environ.get("NRE_AGENT_BGP_DEVICE", "unknown").strip() or "unknown"
@@ -357,10 +360,12 @@ def _run_bgp_diagnostics_iteration() -> None:
 
     _apply_simulated_approval_override(incident_key)
 
-    if decision.approval_required:
+    approval_record = get_approval_record(incident_key)
+
+    if decision.approval_required and approval_record is None:
         reasons = [action.summary for action in decision.gated_actions]
 
-        record = create_pending_approval(
+        approval_record = create_pending_approval(
             scenario=incident_key,
             risk_level=_highest_gated_risk(decision),
             blast_radius_score=len(decision.gated_actions),
@@ -369,7 +374,7 @@ def _run_bgp_diagnostics_iteration() -> None:
 
         print(
             f"[nre_agent] ts={_utc_now()} incident_id={incident_key} "
-            f"decision_action=approval_pending approval_status={record.status}",
+            f"decision_action=approval_pending approval_status={approval_record.status}",
             flush=True,
         )
 
@@ -380,7 +385,16 @@ def _run_bgp_diagnostics_iteration() -> None:
                 f"approval_record={summary}",
                 flush=True,
             )
-    else:
+
+    plan_state = build_plan_state(
+        plan=plan,
+        approval_record=approval_record,
+    )
+
+    print(summarize_plan_state(plan_state), flush=True)
+    print(plan_state_to_dict(plan_state), flush=True)
+
+    if not decision.approval_required:
         print(
             f"[nre_agent] ts={_utc_now()} incident_id={incident_key} "
             f"decision_action=no_approval_required",

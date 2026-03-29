@@ -22,13 +22,14 @@ Environment variables:
 
 ### BGP diagnostics mode
 
-This is the decision and planning mode for the validated BGP diagnostics pipeline.
+This is the decision, planning, and state mode for the validated BGP diagnostics pipeline.
 
 The agent:
 - loads a normalized BGP snapshot from a JSON file
 - calls lattice `/diagnostics/bgp`
 - builds an internal decision object
-- builds a future execution plan shape
+- builds an execution plan shape
+- derives a plan state from the approval record
 - suppresses duplicate child gated actions when a parent grouped incident exists
 - creates an approval record for the grouped incident when needed
 - never executes any change
