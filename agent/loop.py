@@ -16,12 +16,14 @@ from agent.approvals import (
 )
 from agent.bgp_decision import build_bgp_decision, decision_to_dict, summarize_bgp_decision
 from agent.client import call_lattice, call_lattice_bgp_diagnostics
+from agent.execution_plan import (
+    build_execution_plan,
+    execution_plan_to_dict,
+    summarize_execution_plan,
+)
 from agent.scenarios import get_next_scenario
 
 
-# In memory cooldown tracking for the current pod lifetime.
-# This prevents immediate re creation of pending approval records
-# right after an approved execution attempt.
 _APPROVAL_COOLDOWN_UNTIL: dict[str, datetime] = {}
 
 
@@ -117,7 +119,7 @@ def _summarize_response(scenario: str, response: dict[str, Any]) -> str:
             f"[nre_agent] ts={_utc_now()} "
             f"scenario={scenario} "
             f"status={status} "
-            f'message=\"{message}\"'
+            f'message="{message}"'
         )
 
     risk_level = str(risk.get("risk_level", "unknown"))
@@ -131,7 +133,7 @@ def _summarize_response(scenario: str, response: dict[str, Any]) -> str:
         f"risk_level={risk_level} "
         f"blast_radius={blast_radius} "
         f"requires_approval={requires_approval} "
-        f'message=\"{message}\"'
+        f'message="{message}"'
     )
 
 
@@ -167,13 +169,6 @@ def _precheck_approval_gate(key: str) -> bool:
 
     Returns True when the agent is allowed to proceed.
     Returns False when the scenario should be skipped for now.
-
-    Rules:
-    pending   -> hold
-    rejected  -> suppress
-    approved  -> reopen and proceed once
-    cooldown  -> skip repeated approval churn
-    no record -> proceed
     """
     if _is_in_cooldown(key):
         remaining = _get_cooldown_remaining_seconds(key)
@@ -211,9 +206,6 @@ def _precheck_approval_gate(key: str) -> bool:
             flush=True,
         )
 
-        # Clear the approval record so the scenario can proceed.
-        # The next high risk result will not immediately recreate a
-        # pending record because cooldown is applied after execution.
         clear_approval_record(key)
 
         print(
@@ -228,15 +220,6 @@ def _precheck_approval_gate(key: str) -> bool:
 def _handle_policy_outcome(scenario: str, response: dict[str, Any]) -> None:
     """
     Policy aware agent behavior for traditional scenario mode.
-
-    low
-    continue
-
-    medium
-    caution
-
-    high or approval required
-    create or reuse approval record, unless cooldown is active
     """
     risk = _extract_risk(response)
     if risk is None:
@@ -299,10 +282,6 @@ def _handle_policy_outcome(scenario: str, response: dict[str, Any]) -> None:
 def _post_execution_bookkeeping(scenario: str, response: dict[str, Any]) -> None:
     """
     Apply post execution bookkeeping for scenario mode.
-
-    If a scenario was reopened through approval and still came back
-    high risk, enter cooldown so the agent does not immediately create
-    a new pending request on the next cycle.
     """
     risk = _extract_risk(response)
     if risk is None:
@@ -311,9 +290,6 @@ def _post_execution_bookkeeping(scenario: str, response: dict[str, Any]) -> None
     risk_level = str(risk.get("risk_level", "unknown"))
     requires_approval = bool(risk.get("requires_approval", False))
 
-    # If the scenario has no approval record now, it means the gate
-    # was reopened and the record was cleared before execution.
-    # If the result still requires approval, start cooldown.
     record = get_approval_record(scenario)
     if record is None and (requires_approval or risk_level == "high"):
         _set_cooldown(scenario)
@@ -328,16 +304,10 @@ def _post_execution_bookkeeping(scenario: str, response: dict[str, Any]) -> None
 def _load_bgp_snapshot() -> dict[str, Any]:
     """
     Load the BGP snapshot JSON from a file.
-
-    This keeps the first nre_agent integration simple and safe:
-    the agent consumes validated diagnostics input without taking on the
-    responsibility of gathering raw network state itself.
     """
     path = Path(
         os.environ.get("NRE_AGENT_BGP_SNAPSHOT_FILE", "/tmp/bgp_snapshot.json")
     )
-
-
 
     data = json.loads(path.read_text())
     if not isinstance(data, dict):
@@ -354,6 +324,7 @@ def _run_bgp_diagnostics_iteration() -> None:
     It does all of the following:
     calls lattice diagnostics
     builds an internal decision object
+    builds a future execution plan shape
     suppresses duplicate child gated actions under a grouped incident
     creates a pending approval record for the incident when needed
     """
@@ -374,14 +345,16 @@ def _run_bgp_diagnostics_iteration() -> None:
     print(response, flush=True)
 
     decision = build_bgp_decision(response)
+    plan = build_execution_plan(decision)
 
     print(summarize_bgp_decision(decision), flush=True)
     print(decision_to_dict(decision), flush=True)
 
+    print(summarize_execution_plan(plan), flush=True)
+    print(execution_plan_to_dict(plan), flush=True)
+
     incident_key = decision.incident_id
 
-    # Apply any simulated approval state to the incident level record. This lets you test
-    # approval state transitions while execution remains disabled.
     _apply_simulated_approval_override(incident_key)
 
     if decision.approval_required:
@@ -418,9 +391,6 @@ def _run_bgp_diagnostics_iteration() -> None:
 def _highest_gated_risk(decision: Any) -> str:
     """
     Return the highest risk seen in the gated action set.
-
-    This is used to write a compact approval record until we extend the approval store
-    to hold richer incident structures.
     """
     rank = {
         "low": 0,
@@ -445,22 +415,6 @@ def _highest_gated_risk(decision: Any) -> str:
 def run_agent_loop() -> None:
     """
     Continuous outer agent loop.
-
-    Scenario mode responsibilities:
-    choose scenario
-    apply approval override before gate check
-    enforce approval gate
-    call lattice
-    summarize result
-    react to policy outcome
-    apply post execution bookkeeping
-
-    BGP diagnostics mode responsibilities:
-    load snapshot
-    call lattice diagnostics
-    build approval ready decision object
-    create incident level approval record when needed
-    never execute changes
     """
     interval_seconds = int(os.environ.get("NRE_AGENT_INTERVAL_SECONDS", "30"))
 
@@ -480,10 +434,8 @@ def run_agent_loop() -> None:
 
             print(f"[nre_agent] selected scenario: {scenario}", flush=True)
 
-            # Apply any simulated approval override before checking the gate.
             _apply_simulated_approval_override(scenario)
 
-            # Enforce approval state before execution attempt.
             if not _precheck_approval_gate(scenario):
                 time.sleep(interval_seconds)
                 continue

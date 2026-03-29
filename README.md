@@ -4,7 +4,7 @@ A simple agent loop that talks to lattice and honors the MCP safety boundary.
 
 ## Modes
 
-The agent now supports two operating modes.
+The agent supports two operating modes.
 
 ### Scenario mode
 
@@ -22,14 +22,15 @@ Environment variables:
 
 ### BGP diagnostics mode
 
-This is the new decision only mode for the validated BGP diagnostics pipeline.
+This is the decision and planning mode for the validated BGP diagnostics pipeline.
 
 The agent:
 - loads a normalized BGP snapshot from a JSON file
 - calls lattice `/diagnostics/bgp`
 - builds an internal decision object
+- builds a future execution plan shape
 - suppresses duplicate child gated actions when a parent grouped incident exists
-- creates an approval record for the grouped incident when approval is required
+- creates an approval record for the grouped incident when needed
 - never executes any change
 
 Environment variables:
@@ -37,7 +38,7 @@ Environment variables:
 - `NRE_AGENT_LATTICE_URL=http://localhost:8091`
 - `NRE_AGENT_BGP_FABRIC=prod-dc-west`
 - `NRE_AGENT_BGP_DEVICE=leaf-01`
-- `NRE_AGENT_BGP_SNAPSHOT_FILE=/path/to/bgp_test.json`
+- `NRE_AGENT_BGP_SNAPSHOT_FILE=/path/to/bgp_snapshot.json`
 
 ## Example
 
@@ -46,5 +47,5 @@ export NRE_AGENT_MODE=bgp_diagnostics
 export NRE_AGENT_LATTICE_URL=http://localhost:8091
 export NRE_AGENT_BGP_FABRIC=prod-dc-west
 export NRE_AGENT_BGP_DEVICE=leaf-01
-export NRE_AGENT_BGP_SNAPSHOT_FILE=/Users/hari/bgp_test.json
+export NRE_AGENT_BGP_SNAPSHOT_FILE=/Users/hari/bgp_snapshot_only.json
 python3 main.py
