@@ -334,8 +334,10 @@ def _load_bgp_snapshot() -> dict[str, Any]:
     responsibility of gathering raw network state itself.
     """
     path = Path(
-        os.environ.get("NRE_AGENT_BGP_SNAPSHOT_FILE", "/data/bgp_snapshot.json")
+        os.environ.get("NRE_AGENT_BGP_SNAPSHOT_FILE", "/tmp/bgp_snapshot.json")
     )
+
+
 
     data = json.loads(path.read_text())
     if not isinstance(data, dict):
